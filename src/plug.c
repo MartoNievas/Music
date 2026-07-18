@@ -9,19 +9,22 @@
  */
 #include <assert.h>
 #include <complex.h>
+#include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <raylib.h>
 #include <rlgl.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#include "tinyfiledialogs.h"
 #define NOB_IMPLEMENTATION
 #define NOB_STRIP_PREFIX
 #include "../thirdparty/nob.h"
@@ -78,6 +81,20 @@ typedef struct {
 } VolumeSlider;
 
 /**
+ * @enum AudioSource
+ * @brief What is currently feeding the visualizer, if anything.
+ *
+ * There are exactly three valid states, so this replaces what used to be
+ * two independent booleans (has_music / system_audio_mode) that only ever
+ * took 3 of their 4 possible combinations.
+ */
+typedef enum {
+  AUDIO_SOURCE_NONE,   ///< Nothing loaded yet; showing the file-picker prompt
+  AUDIO_SOURCE_TRACK,  ///< Playing a Music stream from the playlist
+  AUDIO_SOURCE_SYSTEM, ///< Visualizing the system's audio output (loopback)
+} AudioSource;
+
+/**
  * @struct Plug
  * @brief Main plugin state containing all application data
  */
@@ -92,10 +109,12 @@ typedef struct {
   float circle_radius_location;
   float circle_power_location;
 
-  bool error;      ///< Error state flag
-  bool has_music;  ///< Whether any music is loaded
-  bool paused;     ///< Playback pause state
-  bool fullscreen; ///< Fullscreen visualization mode
+  bool error;         ///< Error state flag
+  AudioSource source; ///< What is currently feeding the visualizer, if anything
+  bool paused;        ///< Playback pause state
+  bool fullscreen;    ///< Fullscreen visualization mode
+  bool fullscreen_before_system; ///< fullscreen state to restore when leaving
+                                 ///< system audio mode
 
   double last_mouse_move_time; ///< Timestamp of last mouse movement
   bool mouse_active;           ///< Whether mouse is recently active
@@ -132,6 +151,14 @@ typedef struct {
 
   float stabilization_timer;
   bool is_stabilizing;
+
+  /* System audio (loopback) capture */
+  pid_t sys_audio_pid; ///< PID of the `parec` capture process (-1 if none)
+  int sys_audio_fd;    ///< Read end of the pipe from the capture process (-1 if
+                       ///< none)
+  pthread_t sys_audio_thread; ///< Thread feeding captured samples into the ring
+                              ///< buffer
+  atomic_bool sys_audio_running; ///< Tells the capture thread to keep running
 } Plug;
 Plug *plug = NULL;
 /* Compile-time assertion to ensure icon array matches enum */
@@ -179,6 +206,28 @@ static Track *current_track(void) {
   }
   return NULL;
 }
+
+/**
+ * @brief True while a playlist Track is active; the only state where
+ * current_track() is guaranteed non-NULL and its stream can be controlled.
+ */
+static bool has_active_track(void) {
+  return plug->source == AUDIO_SOURCE_TRACK;
+}
+
+/**
+ * @brief True while visualizing the system's audio output instead of a
+ * loaded track.
+ */
+static bool is_system_audio(void) {
+  return plug->source == AUDIO_SOURCE_SYSTEM;
+}
+
+/**
+ * @brief True whenever there is anything for the visualizer to draw bars
+ * for, be it a track or system audio.
+ */
+static bool has_audio_loaded(void) { return plug->source != AUDIO_SOURCE_NONE; }
 
 /**
  * @brief Updates mouse activity state for UI auto-hiding in fullscreen
@@ -279,13 +328,223 @@ static void process_audio(void *bufferData, unsigned int frames) {
 }
 
 /**
+ * @brief Reads the current default PulseAudio/PipeWire sink and derives its
+ * monitor source name, which carries whatever the system is currently
+ * outputting.
+ */
+static bool get_default_monitor_source(char *out, size_t out_size) {
+  FILE *fp = popen("pactl get-default-sink", "r");
+  if (!fp)
+    return false;
+
+  char sink[256] = {0};
+  bool ok = fgets(sink, sizeof(sink), fp) != NULL;
+  pclose(fp);
+  if (!ok)
+    return false;
+
+  size_t len = strlen(sink);
+  while (len > 0 && (sink[len - 1] == '\n' || sink[len - 1] == '\r'))
+    sink[--len] = '\0';
+  if (len == 0)
+    return false;
+
+  snprintf(out, out_size, "%s.monitor", sink);
+  return true;
+}
+
+/**
+ * @brief Background thread that pulls raw float samples out of the capture
+ * process' stdout pipe and feeds them into the shared ring buffer, mirroring
+ * what process_audio() does for regular track playback.
+ */
+static void *system_audio_capture_thread(void *arg) {
+  (void)arg;
+  float buf[1024];
+
+  while (atomic_load_explicit(&plug->sys_audio_running, memory_order_acquire)) {
+    ssize_t n = read(plug->sys_audio_fd, buf, sizeof(buf));
+    if (n <= 0)
+      break;
+
+    size_t count = (size_t)n / sizeof(float);
+    unsigned w =
+        atomic_load_explicit(&plug->sample_write, memory_order_relaxed);
+    for (size_t i = 0; i < count; i++) {
+      plug->samples[w] = buf[i];
+      w = (w + 1) % N;
+    }
+    atomic_store_explicit(&plug->sample_write, w, memory_order_release);
+  }
+
+  return NULL;
+}
+
+/**
+ * @brief Stops the system audio capture process/thread, if running. Safe to
+ * call even when capture was never started.
+ */
+static void stop_system_audio_capture(void) {
+  atomic_store_explicit(&plug->sys_audio_running, false, memory_order_release);
+
+  if (plug->sys_audio_fd >= 0) {
+    close(plug->sys_audio_fd); // Unblocks the pending read() in the thread
+    plug->sys_audio_fd = -1;
+  }
+
+  if (plug->sys_audio_pid > 0)
+    kill(plug->sys_audio_pid, SIGTERM);
+
+  if (plug->sys_audio_thread) {
+    pthread_join(plug->sys_audio_thread, NULL);
+    plug->sys_audio_thread = 0;
+  }
+
+  if (plug->sys_audio_pid > 0) {
+    waitpid(plug->sys_audio_pid, NULL, 0);
+    plug->sys_audio_pid = -1;
+  }
+}
+
+/**
+ * @brief Spawns `parec` reading from the default sink's monitor source and
+ * starts the thread that feeds its output into the visualizer.
+ * @return true on success, false if PulseAudio/PipeWire or `parec` are
+ * unavailable.
+ */
+static bool start_system_audio_capture(void) {
+  char monitor[300];
+  if (!get_default_monitor_source(monitor, sizeof(monitor))) {
+    fprintf(stderr, "ERROR: could not determine default audio sink "
+                    "(is PulseAudio/PipeWire running?)\n");
+    return false;
+  }
+
+  int pipefd[2];
+  if (pipe(pipefd) != 0)
+    return false;
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return false;
+  }
+
+  if (pid == 0) {
+    /* Child: redirect stdout to the pipe and exec parec */
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[1]);
+
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull != -1) {
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+
+    execlp("parec", "parec", "--format=float32le", "--rate=44100",
+           "--channels=1", "-d", monitor, (char *)NULL);
+    _exit(127); /* execlp failed (e.g. parec not installed) */
+  }
+
+  /* Parent */
+  close(pipefd[1]);
+
+  plug->sys_audio_pid = pid;
+  plug->sys_audio_fd = pipefd[0];
+  plug->sample_rate = 44100;
+  atomic_store_explicit(&plug->sys_audio_running, true, memory_order_release);
+
+  if (pthread_create(&plug->sys_audio_thread, NULL, system_audio_capture_thread,
+                     NULL) != 0) {
+    atomic_store_explicit(&plug->sys_audio_running, false,
+                          memory_order_release);
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+    close(pipefd[0]);
+    plug->sys_audio_pid = -1;
+    plug->sys_audio_fd = -1;
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * @brief Toggles between visualizing system audio (whatever the OS is
+ * currently outputting, via the default sink's monitor source) and the
+ * loaded playlist.
+ */
+static void toggle_system_audio_mode(void) {
+  if (is_system_audio()) {
+    stop_system_audio_capture();
+
+    memset(plug->samples, 0, sizeof(plug->samples));
+    memset(plug->bars, 0, sizeof(plug->bars));
+    memset(plug->smear, 0, sizeof(plug->smear));
+    memset(plug->spectrum, 0, sizeof(plug->spectrum));
+    atomic_store(&plug->sample_write, 0);
+    plug->bass_history = 0.0f;
+    plug->overall_level = 0.5f;
+
+    plug->fullscreen = plug->fullscreen_before_system;
+
+    Track *t = current_track();
+    if (t) {
+      plug->source = AUDIO_SOURCE_TRACK;
+      plug->sample_rate = t->music.stream.sampleRate;
+      AttachAudioStreamProcessor(t->music.stream, process_audio);
+      ResumeMusicStream(t->music);
+      plug->paused = false;
+    } else {
+      plug->source = AUDIO_SOURCE_NONE;
+    }
+    return;
+  }
+
+  Track *t = current_track();
+  if (t) {
+    PauseMusicStream(t->music);
+    DetachAudioStreamProcessor(t->music.stream, process_audio);
+  }
+
+  memset(plug->samples, 0, sizeof(plug->samples));
+  memset(plug->bars, 0, sizeof(plug->bars));
+  memset(plug->smear, 0, sizeof(plug->smear));
+  memset(plug->spectrum, 0, sizeof(plug->spectrum));
+  atomic_store(&plug->sample_write, 0);
+  plug->bass_history = 0.0f;
+  plug->overall_level = 0.5f;
+
+  if (start_system_audio_capture()) {
+    plug->source = AUDIO_SOURCE_SYSTEM;
+    plug->paused = false;
+    plug->is_stabilizing = true;
+    plug->stabilization_timer = 0.5f;
+
+    /* System audio always shows fullscreen; remember what to go back to */
+    plug->fullscreen_before_system = plug->fullscreen;
+    plug->fullscreen = true;
+
+    /* Leave no stale track-only UI showing on top of the visualizer */
+    plug->show_browser = false;
+    plug->volume_slider.visible = false;
+  } else if (t) {
+    AttachAudioStreamProcessor(t->music.stream, process_audio);
+    ResumeMusicStream(t->music);
+    plug->paused = false;
+  }
+}
+
+/**
  * @brief Draws playback progress bar and handles seeking
  *
  * Displays current position in track and allows clicking to seek.
  * Only shown in windowed mode.
  */
 static void draw_progress(void) {
-  if (!plug->has_music || plug->fullscreen)
+  if (!has_active_track() || plug->fullscreen)
     return;
 
   /* Calculate progress percentage */
@@ -347,6 +606,10 @@ static void switch_track(int index) {
   if (plug->tracks.count == 0)
     return;
 
+  if (is_system_audio()) {
+    stop_system_audio_capture();
+  }
+
   /* Detach audio processor from previous track */
   Track *prev = current_track();
   if (prev) {
@@ -382,7 +645,7 @@ static void switch_track(int index) {
   PlayMusicStream(next->music);
 
   plug->paused = false;
-  plug->has_music = true;
+  plug->source = AUDIO_SOURCE_TRACK;
 
   plug->is_stabilizing = true;
   plug->stabilization_timer = 0.5f;
@@ -398,7 +661,7 @@ static void switch_track(int index) {
  * - Auto-scrolling text for long names
  */
 static void draw_queue(void) {
-  if (plug->fullscreen || !plug->has_music)
+  if (plug->fullscreen || !has_active_track())
     return;
 
   int w = GetRenderWidth();
@@ -506,7 +769,7 @@ static void draw_bars(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
 
-  if (!plug->has_music)
+  if (!has_audio_loaded())
     return;
 
   /* Calculate bar layout based on mode */
@@ -519,7 +782,9 @@ static void draw_bars(void) {
   float max_bar_height_factor;
 
   if (plug->fullscreen) {
-    if (plug->mouse_active) {
+    /* System audio never shows a UI bar, so it never needs to reserve
+     * space for one, regardless of mouse activity. */
+    if (plug->mouse_active && has_active_track()) {
       // Con UI visible: barras más pequeñas para dejar espacio a la UI
       base_y = h * 0.95f;
       max_bar_height_factor = 0.70f; // Reducido de 0.75f
@@ -653,7 +918,7 @@ static void draw_bars(void) {
  * 4. Apply enhanced bass boost and smoothing
  */
 static void update_visualizer(void) {
-  if (plug->has_music && !plug->paused) {
+  if (has_audio_loaded() && !plug->paused) {
     if (plug->is_stabilizing) {
       plug->stabilization_timer -= GetFrameTime();
       if (plug->stabilization_timer <= 0.0f) {
@@ -820,7 +1085,8 @@ static void draw_volume_slider(void) {
 
       plug->volume_slider.value = new_value;
       plug->master_vol = new_value;
-      SetMusicVolume(current_track()->music, plug->master_vol);
+      if (has_active_track())
+        SetMusicVolume(current_track()->music, plug->master_vol);
 
       /* Update volume level icon */
       if (plug->master_vol <= 0.01f)
@@ -831,6 +1097,26 @@ static void draw_volume_slider(void) {
         plug->volume_level = 2;
     }
   }
+}
+
+/**
+ * @brief Draws a small indicator while visualizing system audio instead of a
+ * loaded track.
+ */
+static void draw_system_audio_badge(void) {
+  if (!is_system_audio())
+    return;
+
+  const char *label = "System Audio  [SPACE pausar, S salir]";
+  float font_size = 22.0f;
+  Vector2 size = MeasureTextEx(plug->font, label, font_size, 0);
+  Vector2 pos = {14, 14};
+
+  DrawRectangleRounded(
+      (Rectangle){pos.x - 8, pos.y - 4, size.x + 16, size.y + 8}, 0.3f, 4,
+      (Color){0x10, 0x10, 0x10, 0xC0});
+  DrawTextEx(plug->font, label, pos, font_size, 0,
+             (Color){0x4c, 0xd9, 0x64, 0xFF});
 }
 
 /**
@@ -879,7 +1165,7 @@ static void tooltip(Rectangle boundary, const char *label) {
  * Displays tooltips on hover for each control.
  */
 static void draw_ui_bar(void) {
-  if (!plug->has_music)
+  if (!has_active_track())
     return;
 
   int w = GetRenderWidth();
@@ -1006,7 +1292,7 @@ static void draw_ui_bar(void) {
  * Only operates when music is playing and not at end of playlist.
  */
 static void next_track_in_queue(void) {
-  if (!plug->has_music || plug->tracks.count <= 1 || plug->paused ||
+  if (!has_active_track() || plug->tracks.count <= 1 || plug->paused ||
       (size_t)plug->current_track == plug->tracks.count - 1)
     return;
 
@@ -1025,7 +1311,7 @@ static void next_track_in_queue(void) {
  * @return true if UI bar should be drawn
  */
 static bool is_ui_bar_active(void) {
-  if (!plug->has_music)
+  if (!has_active_track())
     return false;
 
   if (plug->fullscreen)
@@ -1035,7 +1321,24 @@ static bool is_ui_bar_active(void) {
 }
 
 /**
- * @brief Handles keyboard and mouse input for playback controls
+ * @brief Input handling while visualizing system audio.
+ *
+ * There is no track to seek, mute, or skip, so pausing the visualization is
+ * the only meaningful shortcut here.
+ *
+ * Keyboard shortcuts:
+ * - SPACE: Pause/resume the visualization
+ */
+static void handle_input_system_audio(void) {
+  if (IsKeyPressed(KEY_SPACE))
+    plug->paused = !plug->paused;
+}
+
+/**
+ * @brief Input handling while a playlist track is active.
+ *
+ * Only ever runs when has_active_track() holds, so current_track() is
+ * guaranteed non-NULL throughout.
  *
  * Keyboard shortcuts:
  * - F: Toggle fullscreen
@@ -1044,18 +1347,12 @@ static bool is_ui_bar_active(void) {
  * - N: Next track
  * - P: Previous track
  */
-static void handle_input(void) {
-  if (!plug->has_music)
-    return;
-
-  /* Toggle fullscreen mode */
+static void handle_input_track(void) {
   if (IsKeyPressed(KEY_F)) {
     plug->fullscreen = !plug->fullscreen;
   }
 
-  /* Toggle play/pause */
   if (IsKeyPressed(KEY_SPACE)) {
-
     if (plug->paused)
       ResumeMusicStream(current_track()->music);
     else
@@ -1107,6 +1404,30 @@ static void handle_input(void) {
 }
 
 /**
+ * @brief Dispatches input handling by audio source.
+ *
+ * 'S' always works since it is the switch between sources; everything else
+ * is scoped to whichever source is active, so system-audio mode structurally
+ * cannot reach playlist-only actions (seek, mute, next/prev) it has no
+ * track to apply them to.
+ */
+static void handle_input(void) {
+  if (IsKeyPressed(KEY_S))
+    toggle_system_audio_mode();
+
+  switch (plug->source) {
+  case AUDIO_SOURCE_NONE:
+    break;
+  case AUDIO_SOURCE_SYSTEM:
+    handle_input_system_audio();
+    break;
+  case AUDIO_SOURCE_TRACK:
+    handle_input_track();
+    break;
+  }
+}
+
+/**
  * @brief Handles drag-and-drop file loading
  *
  * Accepts dropped audio files and adds them to the playlist.
@@ -1118,6 +1439,7 @@ static void handle_file_drop(void) {
     return;
 
   FilePathList files = LoadDroppedFiles();
+  size_t first_new_index = plug->tracks.count;
 
   for (size_t i = 0; i < files.count; i++) {
     Music music = LoadMusicStream(files.paths[i]);
@@ -1135,15 +1457,13 @@ static void handle_file_drop(void) {
 
   UnloadDroppedFiles(files);
 
-  if (!plug->has_music && plug->tracks.count > 0) {
-    plug->current_track = 0;
-    plug->has_music = true;
+  if (!has_active_track() && plug->tracks.count > first_new_index) {
     plug->paused = false;
 
     memset(plug->samples, 0, sizeof(plug->samples));
     atomic_store(&plug->sample_write, 0);
 
-    switch_track(0);
+    switch_track((int)first_new_index);
   }
 }
 
@@ -1216,6 +1536,45 @@ static bool add_track_from_path(const char *path) {
 }
 
 /**
+ * @brief Resolves the user's music directory for the initial browser view.
+ *
+ * Prefers the desktop's configured XDG music folder (respects locale and
+ * user customization), then falls back to common folder names under HOME,
+ * then HOME itself, then the working directory.
+ */
+static void resolve_music_dir(char *out, size_t out_size) {
+  FILE *fp = popen("xdg-user-dir MUSIC 2>/dev/null", "r");
+  if (fp) {
+    char line[512] = {0};
+    bool ok = fgets(line, sizeof(line), fp) != NULL;
+    pclose(fp);
+    if (ok) {
+      size_t len = strlen(line);
+      while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+        line[--len] = '\0';
+      if (len > 0 && DirectoryExists(line)) {
+        snprintf(out, out_size, "%s", line);
+        return;
+      }
+    }
+  }
+
+  const char *home = getenv("HOME");
+  if (home) {
+    static const char *candidates[] = {"Music", "Música", "Musica"};
+    for (size_t i = 0; i < ARRAY_LEN(candidates); i++) {
+      snprintf(out, out_size, "%s/%s", home, candidates[i]);
+      if (DirectoryExists(out))
+        return;
+    }
+    snprintf(out, out_size, "%s", home);
+    return;
+  }
+
+  snprintf(out, out_size, ".");
+}
+
+/**
  * @brief Logic to navigate to parent directory.
  */
 static void navigate_to_parent_dir(void) {
@@ -1240,8 +1599,6 @@ static void navigate_to_parent_dir(void) {
  */
 static void draw_internal_browser(void) {
   if (!plug->show_browser)
-    return;
-  if (!plug->has_music)
     return;
   int w = GetRenderWidth();
   int h = GetRenderHeight();
@@ -1306,13 +1663,12 @@ static void draw_internal_browser(void) {
           break;
         } else {
           if (add_track_from_path(path)) {
-            if (!plug->has_music) {
-              // Primera canción: siempre reproducir
-              plug->has_music = true;
-              switch_track(0);
+            // Sin track activo (recién abierto o viniendo de audio del
+            // sistema): reproducir la recién agregada. Si ya hay una
+            // canción sonando, solo se agrega a la cola.
+            if (!has_active_track()) {
+              switch_track((int)plug->tracks.count - 1);
             }
-            // Si ya hay música, simplemente agregar a la cola
-            // No cambiar automáticamente de track
 
             plug->show_browser = false;
           }
@@ -1331,7 +1687,21 @@ static void draw_internal_browser(void) {
     plug->show_browser = false;
 }
 
+/**
+ * @brief Opens the internal file browser, (re)loading plug->current_dir.
+ */
+static void open_browser(void) {
+  if (plug->dir_files.count > 0)
+    UnloadDirectoryFiles(plug->dir_files);
+  plug->dir_files = LoadDirectoryFiles(plug->current_dir);
+  plug->browser_scroll = 0;
+  plug->show_browser = true;
+}
+
 static void handle_file_inputs(void) {
+  if (is_system_audio())
+    return;
+
   Vector2 mouse = GetMousePosition();
 
   // plug->ui_recs[FILE_UI_ICON] is defined in draw_ui_bar
@@ -1340,70 +1710,40 @@ static void handle_file_inputs(void) {
       IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 
   if (IsKeyPressed(KEY_O) || icon_clicked) {
-    plug->show_browser = !plug->show_browser;
-    if (plug->show_browser) {
-      // Clean up old list and force fresh reload from current_dir
-      if (plug->dir_files.count > 0)
-        UnloadDirectoryFiles(plug->dir_files);
-      plug->dir_files = LoadDirectoryFiles(plug->current_dir);
-      plug->browser_scroll = 0;
-    }
+    if (plug->show_browser)
+      plug->show_browser = false;
+    else
+      open_browser();
   }
 }
 
 /**
- * @brief Handles the external file dialog using tinyfiledialogs.
- * Opens by default in the user's Music folder.
+ * @brief Handles the initial "click to browse" empty-state prompt.
+ *
+ * Opens the internal file browser (draw_internal_browser) instead of an
+ * OS-native file dialog: tinyfiledialogs falls back to a console prompt on
+ * systems without zenity/kdialog/similar installed, which for a windowed
+ * app just looks like a hang or pops up in an unrelated terminal.
  */
-static void handle_tiny_dialogs_open(void) {
+static void handle_empty_state_click(void) {
   int w = GetRenderWidth();
   int h = GetRenderHeight();
-  const char *filters[] = {"*.wav", "*.ogg", "*.mp3", "*.flac"};
-  const char *path = NULL;
 
-  // Logic for first-time load (empty state)
-  if (!plug->has_music) {
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      const char *home = getenv("HOME");
-      char default_dir[512] = "./"; // Fallback to current directory
-
-      if (home) {
-        /* * NOTE: On Arch Linux, the folder is usually 'Music' (English).
-         * Change to "Musica" only if your folder is named that way.
-         */
-        snprintf(default_dir, sizeof(default_dir), "%s/Music/", home);
-
-        // Verification: If 'Music' doesn't exist, try 'Musica'
-        if (!DirectoryExists(default_dir)) {
-          snprintf(default_dir, sizeof(default_dir), "%s/Musica/", home);
-        }
-
-        // Final fallback if neither exists
-        if (!DirectoryExists(default_dir)) {
-          snprintf(default_dir, sizeof(default_dir), "%s/", home);
-        }
-      }
-
-      path =
-          tinyfd_openFileDialog("Select Music", default_dir, ARRAY_LEN(filters),
-                                filters, "Music Files", 0);
-
-      if (add_track_from_path(path)) {
-        plug->has_music = true;
-        switch_track(0);
-      }
-    } else {
-      /* Draw central call-to-action message */
-      const char *msg = plug->error ? "Error: Could not load file"
-                                    : "Click to Select File\n(Or Drag & Drop)";
-      Color col = plug->error ? RED : WHITE;
-      Vector2 size =
-          MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
-      Vector2 pos = {(w - size.x) / 2.0f, (h - size.y) / 2.0f};
-
-      DrawTextEx(plug->font, msg, pos, (float)plug->font.baseSize, 0, col);
-    }
+  if (has_audio_loaded())
     return;
+
+  if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+    open_browser();
+  } else {
+    /* Draw central call-to-action message */
+    const char *msg = plug->error ? "Error: Could not load file"
+                                  : "Click to Browse\n(Or Drag & Drop)";
+    Color col = plug->error ? RED : WHITE;
+    Vector2 size =
+        MeasureTextEx(plug->font, msg, (float)plug->font.baseSize, 0);
+    Vector2 pos = {(w - size.x) / 2.0f, (h - size.y) / 2.0f};
+
+    DrawTextEx(plug->font, msg, pos, (float)plug->font.baseSize, 0, col);
   }
 }
 
@@ -1429,8 +1769,11 @@ static void unload_assets(void) {
  */
 void plug_post_reload(Plug *prev) {
   plug = prev;
-  if (plug->has_music) {
+  if (has_active_track()) {
     AttachAudioStreamProcessor(current_track()->music.stream, process_audio);
+  }
+  if (is_system_audio()) {
+    start_system_audio_capture();
   }
   load_assets();
 }
@@ -1441,8 +1784,12 @@ void plug_post_reload(Plug *prev) {
  * @return Pointer to plugin state to preserve
  */
 Plug *plug_pre_reload(void) {
-  if (plug->has_music) {
+  if (has_active_track()) {
     DetachAudioStreamProcessor(current_track()->music.stream, process_audio);
+  }
+  if (is_system_audio()) {
+    /* Capture thread runs code from this .so; must stop it before dlclose */
+    stop_system_audio_capture();
   }
   unload_assets();
 
@@ -1466,6 +1813,7 @@ void plug_init(void) {
 
   load_assets();
   plug->fullscreen = false;
+  plug->fullscreen_before_system = false;
   plug->mouse_active = false;
   plug->last_mouse_move_time = -100.0f;
   plug->volume_level = 1;
@@ -1476,12 +1824,12 @@ void plug_init(void) {
 
   plug->bass_history = 0.0f;
   plug->overall_level = 0.5f;
-  const char *home = getenv("HOME");
-  if (home) {
-    snprintf(plug->current_dir, sizeof(plug->current_dir), "%s/Musica", home);
-  } else {
-    strcpy(plug->current_dir, "."); // Fallback to current directory
-  }
+
+  plug->source = AUDIO_SOURCE_NONE;
+  plug->sys_audio_pid = -1;
+  plug->sys_audio_fd = -1;
+
+  resolve_music_dir(plug->current_dir, sizeof(plug->current_dir));
   /* Initialize audio processing buffers */
   memset(plug->samples, 0, sizeof(plug->samples));
   memset(plug->bars, 0, sizeof(plug->bars));
@@ -1504,12 +1852,12 @@ void plug_init(void) {
  */
 void plug_update(void) {
   /* Update audio stream */
-  if (plug->has_music && !plug->paused) {
+  if (has_active_track() && !plug->paused) {
     UpdateMusicStream(current_track()->music);
   }
 
   /* Process input and state updates */
-  handle_tiny_dialogs_open();
+  handle_empty_state_click();
   update_mouse_state();
   handle_input();
   handle_file_drop();
@@ -1521,13 +1869,13 @@ void plug_update(void) {
   ClearBackground((Color){0x18, 0x18, 0x18, 0xFF});
 
   update_visualizer();
-  draw_queue();
-
-  draw_progress();
   draw_bars();
+  draw_queue();
+  draw_progress();
   draw_ui_bar();
   draw_volume_slider();
-
   draw_internal_browser();
+  draw_system_audio_badge();
+
   EndDrawing();
 }
